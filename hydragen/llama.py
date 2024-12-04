@@ -590,8 +590,6 @@ class HydragenLlamaAttention(nn.Module):
             raise ValueError(f"Unknown mode {self.mode}")
 
         attn_output = rearrange(attn_output, "b n h d -> b n (h d)")
-
-        attn_output = self.o_proj(attn_output)
         return attn_output
 
 
@@ -761,7 +759,6 @@ class HydragenLlamaModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
-
         return hidden_states
 
 
@@ -961,6 +958,7 @@ class HydragenLlamaForCausalLM(nn.Module):
         seq_lens: Tensor | None = None,
         use_graph: bool = False,
         full_logits: bool = False,
+        return_hidden_states=False,
     ):
         if use_graph:
             assert self.graphed_model is not None
@@ -993,6 +991,9 @@ class HydragenLlamaForCausalLM(nn.Module):
 
         # hf does this
         logits = logits.float()
+
+        if return_hidden_states:
+            return logits, hidden_states
 
         return logits
 
@@ -1348,14 +1349,20 @@ class HydragenLlamaForCausalLM(nn.Module):
 
         self.set_mode(AttentionMode.DECODE)
 
+        value_fns = []
+
         for generated_token_idx in range(max_new_tokens - 1):
             position_ids = starting_position_ids + generated_token_idx
 
-            decode_logits = self(
+            decode_logits, hidden_states = self(
                 input_ids=current_token_ids,
                 position_ids=position_ids,
                 use_graph=self.graphed_model is not None,
+                return_hidden_states=True,
             )
+
+            values = self.model.v_head(hidden_states)
+            value_fns.append(values)
 
             if return_logits:
                 logits_to_return.append(decode_logits[:, -1])
@@ -1380,6 +1387,7 @@ class HydragenLlamaForCausalLM(nn.Module):
                 ]
 
         cat_decoded_ids = torch.cat(decoded_tokens, dim=-1)
+        value_fns = torch.cat(value_fns, dim=-1)
 
         if shared_cache_op == SharedCacheOp.PRESERVE:
             self.truncate_shared_caches(og_num_shared_caches)
@@ -1393,7 +1401,7 @@ class HydragenLlamaForCausalLM(nn.Module):
         if return_logits:
             return cat_decoded_ids, logits_to_return
 
-        return cat_decoded_ids
+        return cat_decoded_ids, value_fns
 
     @classmethod
     def from_pretrained(
