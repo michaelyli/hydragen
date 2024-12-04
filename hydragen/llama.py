@@ -1107,14 +1107,15 @@ class HydragenLlamaForCausalLM(nn.Module):
                     batch_idx, sequence_length - 1
                 ]
 
-        out = self(
+        out, hs = self(
             input_ids=input_ids,
             position_ids=position_ids,
             seq_lens=seq_lens,
             full_logits=full_logits,
+            return_hidden_states=True,
         )
 
-        return out
+        return out, hs
 
     @torch.no_grad()
     def process_unique(
@@ -1293,7 +1294,7 @@ class HydragenLlamaForCausalLM(nn.Module):
             starting_logits = starting_logits.unsqueeze(1)
 
         for sid, slen in zip(shared_ids, shared_seq_lens):
-            starting_logits = self.append_shared(sid, slen)
+            starting_logits, init_hs = self.append_shared(sid, slen)
 
         if disable_hydragen:
             self.model.set_disable_hydragen(True)
@@ -1307,6 +1308,7 @@ class HydragenLlamaForCausalLM(nn.Module):
             self.repeat_per_completion_cache_for_num_samples(
                 suffix_ids.shape[0], num_return_sequences
             )
+
 
         prefill_logits = starting_logits[:, -1]
         raw_first_token_ids = self.sample_from_logits(
@@ -1341,6 +1343,7 @@ class HydragenLlamaForCausalLM(nn.Module):
             finished_sequences = None
 
         decoded_tokens = [first_token_ids]
+        value_fns = [init_hs]
 
         if token_overrides is None:
             current_token_ids = first_token_ids
@@ -1348,8 +1351,6 @@ class HydragenLlamaForCausalLM(nn.Module):
             current_token_ids = token_overrides[:, 0:1]
 
         self.set_mode(AttentionMode.DECODE)
-
-        value_fns = []
 
         for generated_token_idx in range(max_new_tokens - 1):
             position_ids = starting_position_ids + generated_token_idx
