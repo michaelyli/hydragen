@@ -1,32 +1,26 @@
-from transformers.models.llama.modeling_llama import (
-    LlamaMLP,
-    LlamaRotaryEmbedding,
-    LlamaLinearScalingRotaryEmbedding,
-    LlamaDynamicNTKScalingRotaryEmbedding,
-    LlamaRMSNorm,
-    apply_rotary_pos_emb,
-    LlamaConfig,
-    LlamaForCausalLM,
-)
-
-from einops import rearrange
+import os
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import torch
-from torch import nn, Tensor
-import os
-
-from typing import Optional, List, Union
-
+from accelerate import init_empty_weights
+from einops import rearrange
+from torch import Tensor, nn
 from tqdm import tqdm
-
-from hydragen.attention import (
-    hydragen_attention,
+from transformers import AutoTokenizer
+from transformers.models.llama.modeling_llama import (
+    LlamaConfig,
+    LlamaDynamicNTKScalingRotaryEmbedding,
+    LlamaForCausalLM,
+    LlamaLinearScalingRotaryEmbedding,
+    LlamaMLP,
+    LlamaRMSNorm,
+    LlamaRotaryEmbedding,
+    apply_rotary_pos_emb,
 )
 
+from hydragen.attention import hydragen_attention
 from hydragen.flash import flash_attention, flash_attention_seqlen
-
-from dataclasses import dataclass
-from accelerate import init_empty_weights
 
 
 def repeat_to_batch_size(tensors: list[Tensor], target_batch_size: int | None = None):
@@ -252,7 +246,6 @@ class PerLayerKVCache(nn.Module):
             .expand(bs, -1, n_heads, head_dim)
             .to(torch.int64)
         )
-        
         k_out.scatter_(1, expanded_input_pos, k_val)
         v_out.scatter_(1, expanded_input_pos, v_val)
 
@@ -590,6 +583,7 @@ class HydragenLlamaAttention(nn.Module):
             raise ValueError(f"Unknown mode {self.mode}")
 
         attn_output = rearrange(attn_output, "b n h d -> b n (h d)")
+        attn_output = self.o_proj(attn_output)
         return attn_output
 
 
@@ -624,7 +618,6 @@ class HydragenLlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -1073,7 +1066,7 @@ class HydragenLlamaForCausalLM(nn.Module):
 
     @torch.no_grad()
     def append_shared(
-        self, input_ids: Tensor, seq_lens: Optional[Tensor] = None, full_logits: Optional[bool] = False
+        self, input_ids: Tensor, seq_lens: Optional[Tensor] = None, full_logits: Optional[bool] = False, return_hidden_states: bool = False
     ) -> Tensor:
         """
         Adds a new level of shared cache to the model.
@@ -1112,6 +1105,7 @@ class HydragenLlamaForCausalLM(nn.Module):
             position_ids=position_ids,
             seq_lens=seq_lens,
             full_logits=full_logits,
+            return_hidden_states=return_hidden_states,
         )
 
         return out
@@ -1121,6 +1115,7 @@ class HydragenLlamaForCausalLM(nn.Module):
         self,
         input_ids: Tensor,
         seq_lens: Tensor | None = None,
+        return_hidden_states: bool = False,
     ) -> Tensor:
         self.set_mode(AttentionMode.UNIQUE_PREFILL)
 
@@ -1143,6 +1138,7 @@ class HydragenLlamaForCausalLM(nn.Module):
             input_ids=input_ids,
             position_ids=position_ids,
             seq_lens=seq_lens,
+            return_hidden_states=return_hidden_states,
         )
 
     def repeat_per_completion_cache_for_num_samples(
@@ -1171,6 +1167,7 @@ class HydragenLlamaForCausalLM(nn.Module):
         disable_attention: bool = False,
         disable_hierarchy: bool = False,
         token_overrides: Optional[Tensor] = None,
+        tokenizer: Optional[AutoTokenizer] = None,
     ):
         """
         Generates text from the model.
@@ -1281,19 +1278,45 @@ class HydragenLlamaForCausalLM(nn.Module):
             suffix_ids = None
             suffix_seq_lens = None
         elif len(input_ids) > 0:
+            if True:
+                a = 1
+
+            if len(input_ids) > 1:
+                raise ValueError("Have not implemented value function to work with this")
+
             shared_ids = input_ids[:-1]
             shared_seq_lens = seq_lens[:-1]
             suffix_ids = input_ids[-1]
             suffix_seq_lens = seq_lens[-1]
         else: # passing starting logits instead of ids
+            raise Exception("Should not happen")
             shared_ids,shared_seq_lens,suffix_ids,suffix_seq_lens = [],[],None,None
 
 
         if starting_logits is not None:
             starting_logits = starting_logits.unsqueeze(1)
 
+        starting_hidden_states = None
+
+        a = 1
+
+        if len(shared_ids) > 1 or len(shared_seq_lens) > 1:
+            raise ValueError("Have not implemented value function to work with this")
+
         for sid, slen in zip(shared_ids, shared_seq_lens):
-            starting_logits = self.append_shared(sid, slen)
+            starting_logits, starting_hidden_states = self.append_shared(sid, slen, return_hidden_states=True)
+
+        if hasattr(self, "v_head") and starting_hidden_states is not None:
+            value_out = self.v_head(starting_hidden_states)
+            
+            # Slice to take the last token of the prefix
+            value_out_final = []
+            for batch_idx, end_of_prefix_idx in enumerate(shared_seq_lens[0]):
+                value_out_final.append(value_out[batch_idx, (end_of_prefix_idx - 1):end_of_prefix_idx])
+
+            value_out = torch.cat(value_out_final, dim=0)
+        else:
+            value_out = None
 
         if disable_hydragen:
             self.model.set_disable_hydragen(True)
@@ -1301,12 +1324,25 @@ class HydragenLlamaForCausalLM(nn.Module):
                 self.model.copy_shared_cache_to_unique(total_batch_size)
 
         if suffix_ids is not None:
-            starting_logits = self.process_unique(suffix_ids, suffix_seq_lens)
+            starting_logits, starting_hidden_states = self.process_unique(suffix_ids, suffix_seq_lens, return_hidden_states=True)
 
             # needed for disable baselines
             self.repeat_per_completion_cache_for_num_samples(
                 suffix_ids.shape[0], num_return_sequences
             )
+
+            if True:
+                 a = 1
+
+            if hasattr(self, "v_head") and value_out is None and starting_hidden_states is not None:
+                value_out = self.v_head(starting_hidden_states)
+            
+            # Slice to take the last token of the prefix
+            value_out_final = []
+            for batch_idx, end_of_prefix_idx in enumerate(suffix_seq_lens):
+                value_out_final.append(value_out[batch_idx, (end_of_prefix_idx - 1):end_of_prefix_idx])
+
+            value_out = torch.cat(value_out_final, dim=0)
 
         prefill_logits = starting_logits[:, -1]
         raw_first_token_ids = self.sample_from_logits(
@@ -1336,11 +1372,25 @@ class HydragenLlamaForCausalLM(nn.Module):
             )
 
         if eos_token_id is not None:
-            finished_sequences = first_token_ids == eos_token_id
+            if isinstance(eos_token_id, int):
+                finished_sequences = first_token_ids == eos_token_id
+            else:
+                assert isinstance(eos_token_id, list)
+                assert isinstance(eos_token_id[0], list), "We use stop phrases, so eos_token_id should be a list of lists"
+
+                if True:
+                    a = 1
+
+                # Couldn't possibly have finished in a single token
+                finished_sequences = torch.zeros_like(first_token_ids, dtype=torch.bool)
         else:
             finished_sequences = None
 
-        decoded_tokens = [first_token_ids]
+        # decoded_tokens = [first_token_ids]
+        # Preallocate a tensor for decoded tokens
+        # Need to do this to check for EOS phrases with tensor slicing
+        decoded_tokens = torch.empty((total_batch_size, max_new_tokens), dtype=torch.long, device=first_token_ids.device)
+        decoded_tokens[:, 0:1] = first_token_ids
 
         if token_overrides is None:
             current_token_ids = first_token_ids
@@ -1349,8 +1399,7 @@ class HydragenLlamaForCausalLM(nn.Module):
 
         self.set_mode(AttentionMode.DECODE)
 
-        value_fns = []
-
+        # decode_hidden_states = []
         for generated_token_idx in range(max_new_tokens - 1):
             position_ids = starting_position_ids + generated_token_idx
 
@@ -1360,9 +1409,7 @@ class HydragenLlamaForCausalLM(nn.Module):
                 use_graph=self.graphed_model is not None,
                 return_hidden_states=True,
             )
-
-            values = self.model.v_head(hidden_states)
-            value_fns.append(values)
+            # decode_hidden_states.append(hidden_states)
 
             if return_logits:
                 logits_to_return.append(decode_logits[:, -1])
@@ -1371,23 +1418,59 @@ class HydragenLlamaForCausalLM(nn.Module):
                 decode_logits[:, -1], temperature=temperature, top_p=top_p
             )
 
+            decoded_tokens[:, generated_token_idx + 1:generated_token_idx + 2] = current_token_ids
+
             if finished_sequences is not None:
-                finished_sequences = torch.logical_or(
-                    finished_sequences, current_token_ids == eos_token_id
-                )
+                if isinstance(eos_token_id, int):
+                    finished_sequences = torch.logical_or(
+                        finished_sequences, current_token_ids == eos_token_id
+                    )
+                else:
+                    if True:
+                        a = 1
+
+                    for eos_token_list in eos_token_id:
+                        if generated_token_idx >= len(eos_token_list) - 2:
+                            eos_token_tensor = torch.tensor(eos_token_list, dtype=torch.long, device=current_token_ids.device)
+
+                            if True:
+                                a = 1
+
+                            finished_sequences = torch.logical_or(
+                                finished_sequences,
+                                torch.all(decoded_tokens[:, generated_token_idx - len(eos_token_list) + 2:generated_token_idx + 2] == eos_token_tensor, dim=-1)[:, None]
+                            )
 
                 if torch.all(finished_sequences):
+                    if True:
+                         a = 1
+
                     break
 
-            decoded_tokens.append(current_token_ids)
+            # decoded_tokens.append(current_token_ids)
 
             if token_overrides is not None:
                 current_token_ids = token_overrides[
                     :, generated_token_idx + 1 : generated_token_idx + 2
                 ]
 
-        cat_decoded_ids = torch.cat(decoded_tokens, dim=-1)
-        value_fns = torch.cat(value_fns, dim=-1)
+        if True:
+            a = 1
+
+        # cat_decode_hidden_states = torch.cat(decode_hidden_states, dim=-2)
+        # cat_decoded_ids = torch.cat(decoded_tokens, dim=-1)
+
+        if True:
+            a = 1
+
+        # TODO(@nband): add value head
+        # if len(decode_hidden_states) > 0:
+        #     # Apply the value head to all hidden states
+        #     value_out = self.v_head(cat_decode_hidden_states)
+
+            # We need to slice the value out based on whichever index was the termination token
+            # TODO(@nband): read Mario-VLLM codebase and implement this
+
 
         if shared_cache_op == SharedCacheOp.PRESERVE:
             self.truncate_shared_caches(og_num_shared_caches)
@@ -1399,9 +1482,9 @@ class HydragenLlamaForCausalLM(nn.Module):
             self.model.set_disable_attention(False)
 
         if return_logits:
-            return cat_decoded_ids, logits_to_return
+            return decoded_tokens, logits_to_return
 
-        return cat_decoded_ids, value_fns
+        return decoded_tokens, value_out
 
     @classmethod
     def from_pretrained(
@@ -1422,6 +1505,79 @@ class HydragenLlamaForCausalLM(nn.Module):
             )
 
         model.load_state_dict(hf_model.state_dict(), assign=True)
+        model.to(hf_model.device)
+
+        model.device = hf_model.device
+        model.dtype = hf_model.dtype
+
+        return model
+
+
+class ValueHead(nn.Module):
+    r"""
+    The ValueHead class implements a head for GPT2 that returns a scalar for each output token.
+    """
+
+    def __init__(self, config, **kwargs):
+        super().__init__()
+
+        self.dropout = nn.Identity()
+        hidden_size = 4096
+        self.summary = nn.Linear(hidden_size, 1)
+
+        self.flatten = nn.Flatten()
+
+    def forward(self, hidden_states):
+
+        if hidden_states.device != self.summary.weight.device:
+            hidden_states = hidden_states.to(self.summary.weight.device)
+
+        output = self.dropout(hidden_states)
+
+        # For now force upcast in fp32 if needed. Let's keep the
+        # output in fp32 for numerical stability.
+        if output.dtype != self.summary.weight.dtype:
+            output = output.to(self.summary.weight.dtype)
+
+        output = self.summary(output)
+        values = torch.tanh(output).squeeze(-1)
+        return values
+    
+    
+class HydragenLlamaWithValueHeadForCausalLM(HydragenLlamaForCausalLM):
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+        self.v_head = ValueHead(config)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: str,
+        **kwargs,
+    ):
+        """Hack to also load in the value head."""
+
+        hf_model = LlamaForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+
+        if hf_model.dtype != torch.float16 and hf_model.dtype != torch.bfloat16:
+            raise ValueError(
+                f"Model must be in float16 or bfloat16, not {hf_model.dtype}"
+            )
+
+        with init_empty_weights(include_buffers=False):
+            model = cls(
+                hf_model.config,
+            )
+
+        # Manually load the value head weights from the checkpoint directory
+        value_head = torch.load(os.path.join(model_name_or_path, "value_head.pth"))
+        hf_state_dict = hf_model.state_dict()
+        hf_state_dict.update(value_head)
+        model.load_state_dict(hf_state_dict, assign=True)
+
+        if True:
+             a = 1
+
         model.to(hf_model.device)
 
         model.device = hf_model.device
